@@ -3,6 +3,7 @@
  * Berjalan sepenuhnya di server — tanpa API/LLM eksternal. Model diunduh sekali lalu di-cache.
  */
 import { spawn } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import { env, pipeline, Tensor } from '@huggingface/transformers';
 import { getFfmpegPath } from './tools.ts';
@@ -98,8 +99,62 @@ export async function detectLanguage(filePath: string, startSeconds = 0): Promis
   return best;
 }
 
+/**
+ * Baca WAV PCM s16le mono 16 kHz langsung dari disk (tanpa ffmpeg) dan ubah ke float32.
+ * Mengembalikan null bila format WAV tidak sesuai, agar pemanggil memakai jalur ffmpeg.
+ */
+async function readWavPcm(filePath: string, startSeconds = 0, lengthSeconds = 0): Promise<Float32Array | null> {
+  const fh = await fs.promises.open(filePath, 'r');
+  try {
+    const header = Buffer.alloc(4096);
+    const { bytesRead } = await fh.read(header, 0, header.length, 0);
+    if (bytesRead < 44 || header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE') {
+      return null;
+    }
+    // Cari chunk "fmt " dan "data"
+    let pos = 12;
+    let dataOffset = -1;
+    let dataSize = 0;
+    let fmtOk = false;
+    while (pos + 8 <= bytesRead) {
+      const id = header.toString('ascii', pos, pos + 4);
+      const size = header.readUInt32LE(pos + 4);
+      if (id === 'fmt ') {
+        const format = header.readUInt16LE(pos + 8);
+        const channels = header.readUInt16LE(pos + 10);
+        const rate = header.readUInt32LE(pos + 12);
+        const bits = header.readUInt16LE(pos + 22);
+        fmtOk = format === 1 && channels === 1 && rate === SAMPLE_RATE && bits === 16;
+      } else if (id === 'data') {
+        dataOffset = pos + 8;
+        dataSize = size;
+        break;
+      }
+      pos += 8 + size + (size % 2);
+    }
+    if (!fmtOk || dataOffset < 0) return null;
+
+    const fileSize = (await fh.stat()).size;
+    const available = Math.min(dataSize || Infinity, fileSize - dataOffset);
+    const startByte = Math.min(available, Math.floor(startSeconds * SAMPLE_RATE) * 2);
+    const lengthBytes = lengthSeconds > 0 ? Math.min(available - startByte, Math.floor(lengthSeconds * SAMPLE_RATE) * 2) : available - startByte;
+    const raw = Buffer.alloc(Math.max(0, lengthBytes - (lengthBytes % 2)));
+    await fh.read(raw, 0, raw.length, dataOffset + startByte);
+
+    const out = new Float32Array(raw.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = raw.readInt16LE(i * 2) / 32768;
+    return out;
+  } finally {
+    await fh.close();
+  }
+}
+
 /** Decode file audio menjadi PCM float32 mono 16 kHz (opsional hanya sebagian). */
 async function decodePcm(filePath: string, startSeconds = 0, lengthSeconds = 0): Promise<Float32Array> {
+  if (filePath.toLowerCase().endsWith('.wav')) {
+    const pcm = await readWavPcm(filePath, startSeconds, lengthSeconds);
+    if (pcm) return pcm;
+  }
   const chunks: Buffer[] = [];
   const window = [
     ...(startSeconds > 0 ? ['-ss', String(startSeconds)] : []),

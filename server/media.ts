@@ -1,6 +1,10 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { getFfmpegPath, runProcess } from './tools.ts';
+
+// Jumlah proses ffmpeg paralel saat mengekstrak audio (decoder audio umumnya single-thread)
+const EXTRACT_CONCURRENCY = Number(process.env.EXTRACT_CONCURRENCY || Math.max(2, Math.min(8, os.cpus().length)));
 
 function parseClock(value: string): number {
   const [h, m, s] = value.split(':').map(Number);
@@ -9,49 +13,44 @@ function parseClock(value: string): number {
 
 /** Durasi media dalam detik (dibaca dari output ffmpeg). 0 bila tidak terdeteksi. */
 export async function probeDuration(filePath: string): Promise<number> {
-  const result = await runProcess(getFfmpegPath(), ['-hide_banner', '-i', filePath]).catch((err) => err);
+  const result = await runProcess(getFfmpegPath(), ['-hide_banner', '-nostdin', '-i', filePath]).catch((err) => err);
   const stderr: string = result?.stderr || '';
   const match = stderr.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/);
   return match ? parseClock(match[1]) : 0;
 }
 
+function friendlyExtractError(err: any): Error {
+  if (/does not contain any stream|Output file #0 does not contain|matches no streams|Output file does not contain/i.test(err.message)) {
+    return new Error('File tidak memiliki track audio yang bisa ditranskrip.');
+  }
+  return new Error(`Gagal mengekstrak audio: ${err.message}`);
+}
+
 /**
- * Ekstrak audio dari video/audio apa pun menjadi MP3 mono 16 kHz — ukuran kecil
- * (~14 MB/jam) namun tetap jernih untuk pengenalan suara.
+ * Argumen ffmpeg: ambil hanya stream audio pertama (video tidak didecode sama sekali)
+ * lalu tulis WAV PCM mono 16 kHz — tanpa proses encoding, jadi jauh lebih cepat dari MP3.
  */
-export async function toSpeechAudio(
-  inputPath: string,
-  outputPath: string,
-  durationSeconds: number,
-  onProgress?: (fraction: number) => void
-): Promise<void> {
-  await runProcess(
-    getFfmpegPath(),
-    [
-      '-hide_banner', '-y',
-      '-i', inputPath,
-      '-vn', '-sn', '-dn',
-      '-ac', '1',
-      '-ar', '16000',
-      '-c:a', 'libmp3lame',
-      '-b:a', '32k',
-      '-progress', 'pipe:1',
-      '-nostats',
-      outputPath,
-    ],
-    {
-      onStdoutLine: (line) => {
-        const m = line.match(/^out_time_(?:us|ms)=(\d+)/);
-        if (m && durationSeconds > 0) {
-          onProgress?.(Math.min(1, Number(m[1]) / 1_000_000 / durationSeconds));
-        }
-      },
-    }
-  ).catch((err) => {
-    if (/does not contain any stream|Output file #0 does not contain|matches no streams/i.test(err.message)) {
-      throw new Error('File tidak memiliki track audio yang bisa ditranskrip.');
-    }
-    throw new Error(`Gagal mengekstrak audio: ${err.message}`);
+function speechArgs(inputPath: string, outputPath: string, window?: { start: number; length: number }) {
+  return [
+    '-hide_banner', '-nostdin', '-y',
+    '-loglevel', 'error',
+    // -ss sebelum -i = seek cepat langsung ke posisi (tanpa mendecode bagian sebelumnya)
+    ...(window ? ['-ss', String(window.start), '-t', String(window.length)] : []),
+    '-i', inputPath,
+    '-map', '0:a:0',
+    '-vn', '-sn', '-dn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-c:a', 'pcm_s16le',
+    '-bitexact',
+    outputPath,
+  ];
+}
+
+/** Ekstrak seluruh audio menjadi satu WAV 16 kHz (dipakai bila durasi tidak diketahui). */
+export async function toSpeechAudio(inputPath: string, outputPath: string): Promise<void> {
+  await runProcess(getFfmpegPath(), speechArgs(inputPath, outputPath)).catch((err) => {
+    throw friendlyExtractError(err);
   });
 }
 
@@ -61,38 +60,55 @@ export interface AudioChunk {
   durationSeconds: number;
 }
 
-/** Potong audio menjadi beberapa bagian berdurasi `chunkSeconds` (tanpa re-encode). */
-export async function splitAudio(
+/**
+ * Ekstrak audio langsung per potongan `chunkSeconds` secara PARALEL (satu ffmpeg per potongan).
+ * Hasilnya WAV siap dibaca Whisper; tidak perlu tahap encode MP3 maupun pemotongan terpisah.
+ */
+export async function extractSpeechChunks(
   inputPath: string,
   outDir: string,
-  chunkSeconds: number
+  durationSeconds: number,
+  chunkSeconds: number,
+  onProgress?: (fraction: number) => void
 ): Promise<AudioChunk[]> {
   await fs.promises.mkdir(outDir, { recursive: true });
-  const listPath = path.join(outDir, 'chunks.csv');
 
-  await runProcess(getFfmpegPath(), [
-    '-hide_banner', '-y',
-    '-i', inputPath,
-    '-f', 'segment',
-    '-segment_time', String(chunkSeconds),
-    '-segment_list', listPath,
-    '-segment_list_type', 'csv',
-    '-c', 'copy',
-    path.join(outDir, 'chunk_%03d.mp3'),
-  ]);
+  const count = Math.max(1, Math.ceil(durationSeconds / chunkSeconds));
+  const chunks: AudioChunk[] = Array.from({ length: count }, (_, i) => {
+    const offset = i * chunkSeconds;
+    return {
+      filePath: path.join(outDir, `chunk_${String(i).padStart(3, '0')}.wav`),
+      offsetSeconds: offset,
+      durationSeconds: Math.min(chunkSeconds, durationSeconds - offset),
+    };
+  });
 
-  const csv = await fs.promises.readFile(listPath, 'utf8');
-  return csv
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((row) => {
-      const [name, start, end] = row.split(',');
-      const offset = Number(start);
-      return {
-        filePath: path.join(outDir, name),
-        offsetSeconds: offset,
-        durationSeconds: Number(end) - offset,
-      };
-    })
-    .filter((c) => c.durationSeconds > 0.5);
+  let done = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const chunk = chunks[next++];
+      // Potongan terakhir tanpa -t agar sisa audio tidak terpotong bila durasi sedikit meleset
+      const isLast = chunk === chunks[chunks.length - 1];
+      await runProcess(
+        getFfmpegPath(),
+        speechArgs(inputPath, chunk.filePath, {
+          start: chunk.offsetSeconds,
+          length: isLast ? chunk.durationSeconds + 60 : chunk.durationSeconds,
+        })
+      ).catch((err) => {
+        throw friendlyExtractError(err);
+      });
+      done++;
+      onProgress?.(done / chunks.length);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(EXTRACT_CONCURRENCY, chunks.length) }, worker));
+
+  // Durasi sebenarnya dihitung dari ukuran data PCM (2 byte per sampel, 16 kHz)
+  for (const chunk of chunks) {
+    const size = (await fs.promises.stat(chunk.filePath)).size;
+    chunk.durationSeconds = Math.max(0, (size - 44) / 32000);
+  }
+  return chunks.filter((c) => c.durationSeconds > 0.5);
 }

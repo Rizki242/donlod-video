@@ -1,5 +1,6 @@
 import path from 'path';
-import { probeDuration, splitAudio, toSpeechAudio } from './media.ts';
+import fs from 'fs';
+import { extractSpeechChunks, probeDuration, toSpeechAudio, type AudioChunk } from './media.ts';
 import { detectLanguage, languageName, loadWhisper, transcribeAudioFile } from './stt.ts';
 
 export interface TranscriptSegment {
@@ -33,7 +34,7 @@ export function formatTime(totalSeconds: number): string {
 }
 
 /**
- * Pipeline lengkap (100% lokal): file media -> audio MP3 16 kHz -> dipotong per 5 menit
+ * Pipeline lengkap (100% lokal): file media -> audio WAV 16 kHz diekstrak paralel per 5 menit
  * -> Whisper mentranskrip tiap potongan -> digabung dengan timestamp absolut.
  */
 export async function transcribeMediaFile(
@@ -51,28 +52,37 @@ export async function transcribeMediaFile(
     );
   }
 
-  const speechPath = path.join(workDir, 'speech.mp3');
+  // Muat model Whisper bersamaan dengan ekstraksi audio (keduanya independen)
+  const whisperReady = loadWhisper();
+
   onProgress?.(0.01, 'Mengekstrak audio dari media...');
-  await toSpeechAudio(inputPath, speechPath, sourceDuration, (f) =>
-    onProgress?.(0.01 + f * 0.07, 'Mengekstrak audio dari media...')
-  );
+  let chunks: AudioChunk[];
+  if (sourceDuration > 0) {
+    chunks = await extractSpeechChunks(inputPath, path.join(workDir, 'chunks'), sourceDuration, CHUNK_SECONDS, (f) =>
+      onProgress?.(0.01 + f * 0.07, `Mengekstrak audio dari media... ${Math.round(f * 100)}%`)
+    );
+  } else {
+    // Durasi tidak terbaca: ekstrak utuh lalu hitung durasinya dari file WAV
+    const speechPath = path.join(workDir, 'speech.wav');
+    await toSpeechAudio(inputPath, speechPath);
+    const size = (await fs.promises.stat(speechPath)).size;
+    chunks = [{ filePath: speechPath, offsetSeconds: 0, durationSeconds: Math.max(0, (size - 44) / 32000) }];
+  }
+  if (chunks.length === 0) {
+    throw new Error('Audio kosong atau terlalu pendek untuk ditranskrip.');
+  }
+  const duration = chunks.reduce((sum, c) => Math.max(sum, c.offsetSeconds + c.durationSeconds), 0);
 
   onProgress?.(0.08, 'Memuat mesin speech-to-text (Whisper)...');
   await loadWhisper((f, message) => onProgress?.(0.08 + f * 0.07, message));
-
-  const duration = (await probeDuration(speechPath)) || sourceDuration;
+  await whisperReady;
 
   let language = (opts.language || 'auto').toLowerCase();
   if (language === 'auto') {
     onProgress?.(0.15, 'Mendeteksi bahasa ucapan...');
-    // Lewati 30 detik awal (sering berisi intro musik) bila media cukup panjang
-    language = await detectLanguage(speechPath, duration > 90 ? 30 : 0);
+    // Lewati 30 detik awal (sering berisi intro musik) bila potongan pertama cukup panjang
+    language = await detectLanguage(chunks[0].filePath, chunks[0].durationSeconds > 90 ? 30 : 0);
   }
-
-  const chunks =
-    duration > CHUNK_SECONDS * 1.2
-      ? await splitAudio(speechPath, path.join(workDir, 'chunks'), CHUNK_SECONDS)
-      : [{ filePath: speechPath, offsetSeconds: 0, durationSeconds: duration }];
 
   const all: Array<{ startSeconds: number; endSeconds: number; text: string }> = [];
   const startedAt = Date.now();
