@@ -1,0 +1,6 @@
+{
+  "name": "VideoScribe AI - Transkrip & Ringkasan Video",
+  "description": "Pengunduh video YouTube & web, ekstraksi audio ke transkrip teks akurat hingga 180 menit, ringkasan poin penting otomatis, serta ekspor PDF, SRT, VTT, dan TXT.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
