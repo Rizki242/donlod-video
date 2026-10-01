@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      ALLOW_CLIENT_PROXY: "false"
+      TRUST_PROXY: "1"
+    volumes:
+      - data:/data
+    expose:
+      - "3000"
+
+  # HTTPS otomatis. Ganti video.example.com dengan domain Anda (DNS A record harus mengarah ke server ini).
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - app
+
+volumes:
+  data:
+  caddy_data:

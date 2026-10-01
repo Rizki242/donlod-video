@@ -517,8 +517,9 @@ function errorHandler(err: any, _req: Request, res: Response, _next: NextFunctio
 // Production vs Development Vite setup
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
-    // Serve static files from dist (server.js hasil build berada di dalam dist/)
-    const distDir = fs.existsSync(path.join(__dirname, 'index.html')) ? __dirname : path.join(__dirname, 'dist');
+    // Frontend ada di dist/; server hasil build ada di build/ agar kodenya tidak ikut disajikan secara statis
+    const distDir = [path.join(__dirname, 'dist'), path.join(__dirname, '..', 'dist')]
+      .find((dir) => fs.existsSync(path.join(dir, 'index.html'))) ?? path.join(__dirname, 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distDir, 'index.html'));

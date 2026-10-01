@@ -15,4 +15,4 @@ ENV NODE_ENV=production \
 # Mount volume persisten di /data agar yt-dlp, model Whisper (~450 MB), dan share tidak hilang saat redeploy
 VOLUME /data
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["node", "build/server.js"]

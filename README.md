@@ -23,7 +23,10 @@ Saat pertama kali jalan, server otomatis mengunduh:
 Aplikasi ini punya backend Express yang menjalankan yt-dlp, ffmpeg, dan Whisper (proses panjang, file besar,
 penyimpanan disk). **Backend tidak bisa berjalan di Vercel Functions** ? Vercel hanya cocok untuk frontend.
 
-1. **Backend**: deploy [Dockerfile](./Dockerfile) ke host yang mendukung container + volume persisten
+0. **Satu server saja (paling sederhana)**: di VPS dengan Docker, ganti `video.example.com` di [Caddyfile](./Caddyfile)
+   dengan domain Anda (DNS A record ke IP server), lalu jalankan `docker compose up -d --build`.
+   Frontend + backend + HTTPS otomatis langsung jalan; Vercel tidak diperlukan.
+1. **Backend** (bila frontend tetap di Vercel): deploy [Dockerfile](./Dockerfile) ke host yang mendukung container + volume persisten
    (Render, Railway, Fly.io, VPS). Mount volume di `/data`, lalu set env:
    `TRUST_PROXY=2`, `ALLOW_CLIENT_PROXY=false`, dan `WHISPER_MODEL` bila perlu. Pastikan RAM ? 2 GB.
 2. **Frontend di Vercel**: ganti `GANTI-DENGAN-URL-BACKEND` di [vercel.json](./vercel.json) dengan domain backend
