@@ -18,6 +18,20 @@ Saat pertama kali jalan, server otomatis mengunduh:
 - **yt-dlp** ke `./bin` (mesin pengunduh)
 - **model Whisper** ke `./models` (~450 MB untuk `whisper-small`, sekali saja)
 
+## Deploy
+
+Aplikasi ini punya backend Express yang menjalankan yt-dlp, ffmpeg, dan Whisper (proses panjang, file besar,
+penyimpanan disk). **Backend tidak bisa berjalan di Vercel Functions** ? Vercel hanya cocok untuk frontend.
+
+1. **Backend**: deploy [Dockerfile](./Dockerfile) ke host yang mendukung container + volume persisten
+   (Render, Railway, Fly.io, VPS). Mount volume di `/data`, lalu set env:
+   `TRUST_PROXY=2`, `ALLOW_CLIENT_PROXY=false`, dan `WHISPER_MODEL` bila perlu. Pastikan RAM ? 2 GB.
+2. **Frontend di Vercel**: ganti `GANTI-DENGAN-URL-BACKEND` di [vercel.json](./vercel.json) dengan domain backend
+   (hanya hostname, mis. `videoscribe-api.onrender.com`), lalu push. `/api/*` akan diteruskan ke backend.
+   Vercel memakai `npm run build:web` sehingga kode server tidak ikut dipublikasikan.
+
+Alternatif paling sederhana: deploy seluruh aplikasi (frontend + backend) hanya dengan Dockerfile dan lewati Vercel.
+
 ## Fitur
 
 - **Pengunduh internal** — yt-dlp + ffmpeg: YouTube, TikTok, Instagram, Facebook, X, Vimeo, link MP4 langsung,

@@ -40,7 +40,9 @@ export interface NetOptions {
  * Mendukung http://, https://, socks4://, socks5://, socks5h:// (mis. proxy lokal dari aplikasi VPN).
  */
 export function resolveProxy(requested?: unknown): string | undefined {
-  const value = (typeof requested === 'string' && requested.trim()) || process.env.PROXY_URL || '';
+  // ALLOW_CLIENT_PROXY=false: abaikan proxy dari klien agar server publik tidak bisa diarahkan ke host sembarang
+  const clientProxy = process.env.ALLOW_CLIENT_PROXY === 'false' ? '' : typeof requested === 'string' ? requested.trim() : '';
+  const value = clientProxy || process.env.PROXY_URL || '';
   if (!value || value === 'none') return undefined;
   let parsed: URL;
   try {

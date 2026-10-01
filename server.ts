@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import { createJob, getJob, publicJob, UPLOAD_DIR, WORK_ROOT } from './server/jobs.ts';
 import { assertPublicUrl } from './server/security.ts';
+import { rateLimit, securityHeaders } from './server/rateLimit.ts';
 import {
   buildDownloadOptions,
   downloadMedia,
@@ -26,6 +27,7 @@ import {
   deleteShare,
   getShare,
   isOwner,
+  mimeFromName,
   publicShare,
   shareFilePath,
   updateShare,
@@ -38,8 +40,25 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+// Di belakang reverse proxy (nginx, Cloudflare, dll.) set TRUST_PROXY=1 agar IP klien terbaca benar untuk rate limit
+if (process.env.TRUST_PROXY) app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY) ? Number(process.env.TRUST_PROXY) : process.env.TRUST_PROXY);
+app.disable('x-powered-by');
+app.use(securityHeaders);
+
+// Transkrip panjang bisa besar, tetapi 20 MB per permintaan JSON berlebihan
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+
+// Pembatasan laju: umum untuk semua API, lebih ketat untuk operasi berat (yt-dlp, Whisper, upload)
+const heavyLimit = rateLimit({
+  windowMs: 10 * 60_000,
+  max: Number(process.env.RATE_LIMIT_HEAVY || 30),
+  message: 'Terlalu banyak permintaan pemrosesan. Coba lagi dalam beberapa menit.',
+});
+app.use('/api', rateLimit({ windowMs: 60_000, max: Number(process.env.RATE_LIMIT_GENERAL || 600) }));
+for (const route of ['/api/video/info', '/api/download', '/api/transcribe/url', '/api/transcribe/upload', '/api/shares', '/api/shares/from-job', '/api/shares/:id/transcribe']) {
+  app.post(route, heavyLimit);
+}
 
 // Siapkan yt-dlp & model Whisper di latar belakang agar permintaan pertama tidak menunggu lama
 getYtDlpPath().catch((err) => console.warn('[tools] yt-dlp belum siap:', err.message));
@@ -63,6 +82,12 @@ function readLanguage(req: Request): string {
   const value = String(req.body?.language || 'auto').toLowerCase();
   return /^(auto|[a-z]{2,3})$/.test(value) ? value : 'auto';
 }
+
+/** Express 4 tidak menangkap penolakan promise di handler async; teruskan ke error middleware. */
+const safe = (fn: (req: Request, res: Response) => Promise<unknown> | unknown) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res)).catch(next);
+  };
 
 /** Validasi URL + proxy dari body permintaan. */
 async function readNetRequest(req: Request): Promise<{ url: string; net: NetOptions }> {
@@ -336,7 +361,6 @@ app.post('/api/shares', receiveUpload, async (req: Request, res: Response) => {
       sourcePath: file.path,
       fileName: file.originalname,
       title: String(req.body.title || ''),
-      mimeType: file.mimetype,
       segments: sanitizeSegments(req.body.segments),
       durationSeconds: Number(req.body.durationSeconds) || undefined,
       language: req.body.language ? String(req.body.language).slice(0, 40) : undefined,
@@ -372,32 +396,40 @@ app.post('/api/shares/from-job', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/api/shares/:id', async (req: Request, res: Response) => {
+app.get('/api/shares/:id', safe(async (req: Request, res: Response) => {
   const meta = await loadShareOr404(req, res);
   if (!meta) return;
   res.json({ ...publicShare(meta), isOwner: isOwner(meta, ownerTokenFrom(req)) });
-});
+}));
 
 // Streaming mendukung Range agar video bisa di-seek di pemutar
-app.get('/api/shares/:id/stream', async (req: Request, res: Response) => {
+app.get('/api/shares/:id/stream', safe(async (req: Request, res: Response) => {
   const meta = await getShare(String(req.params.id));
   if (!meta) {
     res.status(404).send('Video tidak ditemukan.');
     return;
   }
-  res.sendFile(shareFilePath(meta), { headers: { 'Content-Type': meta.mimeType }, acceptRanges: true });
-});
+  // MIME dihitung ulang dari ekstensi file tersimpan (share lama mungkin menyimpan MIME dari klien);
+  // sandbox CSP mencegah skrip berjalan seandainya file dibuka langsung sebagai dokumen
+  res.sendFile(shareFilePath(meta), {
+    headers: {
+      'Content-Type': mimeFromName(meta.storedName),
+      'Content-Security-Policy': 'sandbox',
+    },
+    acceptRanges: true,
+  });
+}));
 
-app.get('/api/shares/:id/download', async (req: Request, res: Response) => {
+app.get('/api/shares/:id/download', safe(async (req: Request, res: Response) => {
   const meta = await getShare(String(req.params.id));
   if (!meta) {
     res.status(404).send('Video tidak ditemukan.');
     return;
   }
   res.download(shareFilePath(meta), meta.fileName);
-});
+}));
 
-app.patch('/api/shares/:id', async (req: Request, res: Response) => {
+app.patch('/api/shares/:id', safe(async (req: Request, res: Response) => {
   const meta = await loadShareOr404(req, res);
   if (!meta) return;
   if (!isOwner(meta, ownerTokenFrom(req))) {
@@ -408,9 +440,9 @@ app.patch('/api/shares/:id', async (req: Request, res: Response) => {
   if (typeof req.body.title === 'string' && req.body.title.trim()) patch.title = req.body.title.trim().slice(0, 200);
   if (req.body.segments !== undefined) patch.segments = sanitizeSegments(req.body.segments);
   res.json(publicShare(await updateShare(meta, patch)));
-});
+}));
 
-app.delete('/api/shares/:id', async (req: Request, res: Response) => {
+app.delete('/api/shares/:id', safe(async (req: Request, res: Response) => {
   const meta = await loadShareOr404(req, res);
   if (!meta) return;
   if (!isOwner(meta, ownerTokenFrom(req))) {
@@ -419,10 +451,10 @@ app.delete('/api/shares/:id', async (req: Request, res: Response) => {
   }
   await deleteShare(meta);
   res.json({ success: true });
-});
+}));
 
 // Pemilik bisa membuat transkrip untuk video yang dibagikan
-app.post('/api/shares/:id/transcribe', async (req: Request, res: Response) => {
+app.post('/api/shares/:id/transcribe', safe(async (req: Request, res: Response) => {
   const meta = await loadShareOr404(req, res);
   if (!meta) return;
   if (!isOwner(meta, ownerTokenFrom(req))) {
@@ -445,7 +477,7 @@ app.post('/api/shares/:id/transcribe', async (req: Request, res: Response) => {
     update(100, 'Transkripsi selesai');
   });
   res.status(202).json({ jobId: job.id });
-});
+}));
 
 // 6. Ringkasan otomatis (ekstraktif, tanpa LLM)
 app.post('/api/summarize', (req: Request, res: Response) => {
@@ -474,6 +506,14 @@ app.post('/api/search', (req: Request, res: Response) => {
   }
 });
 
+/** Penangan error terakhir: respons JSON seragam tanpa membocorkan stack trace. */
+function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
+  console.error('[error]', err);
+  if (res.headersSent) return;
+  const status = err?.status || err?.statusCode || 500;
+  res.status(status).json({ error: status >= 500 ? 'Terjadi kesalahan pada server.' : err.message });
+}
+
 // Production vs Development Vite setup
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
@@ -492,6 +532,8 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   }
+
+  app.use(errorHandler);
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);

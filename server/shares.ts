@@ -4,7 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import type { TranscriptSegment } from './transcribe.ts';
 
 export const SHARES_DIR = process.env.SHARES_DIR || path.join(process.cwd(), 'shares');
@@ -23,17 +23,27 @@ export interface ShareMeta {
   durationSeconds?: number;
   language?: string;
   segments?: TranscriptSegment[];
-  ownerToken: string;
+  /** SHA-256 dari token pemilik; token asli hanya dikirim sekali saat share dibuat. */
+  ownerTokenHash?: string;
+  /** Hanya untuk share lama yang dibuat sebelum token di-hash. */
+  ownerToken?: string;
 }
 
 const MIME_BY_EXT: Record<string, string> = {
   '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
   '.mkv': 'video/x-matroska', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac', '.aac': 'audio/aac',
+  '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac', '.aac': 'audio/aac',
+  '.avi': 'video/x-msvideo', '.wmv': 'video/x-ms-wmv', '.flv': 'video/x-flv', '.3gp': 'video/3gpp',
+  '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg', '.ts': 'video/mp2t', '.wma': 'audio/x-ms-wma', '.amr': 'audio/amr',
 };
 
-export function mimeFromName(name: string, fallback = 'application/octet-stream'): string {
-  return MIME_BY_EXT[path.extname(name).toLowerCase()] || fallback;
+/** MIME hanya ditentukan dari ekstensi yang diizinkan, tidak pernah dari input klien (mencegah XSS lewat text/html). */
+export function mimeFromName(name: string): string {
+  return MIME_BY_EXT[path.extname(name).toLowerCase()] || 'application/octet-stream';
+}
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
 }
 
 function newId(): string {
@@ -59,16 +69,17 @@ export async function createShare(input: {
   sourcePath: string;
   fileName: string;
   title?: string;
-  mimeType?: string;
   segments?: TranscriptSegment[];
   durationSeconds?: number;
   language?: string;
-}): Promise<ShareMeta> {
+}): Promise<ShareMeta & { ownerToken: string }> {
   const id = newId();
   const dir = path.join(SHARES_DIR, id);
   await fs.promises.mkdir(dir, { recursive: true });
 
-  const ext = path.extname(input.fileName).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.bin';
+  // Ekstensi di luar daftar putih disimpan sebagai .bin agar tidak pernah disajikan sebagai HTML/skrip
+  const rawExt = path.extname(input.fileName).toLowerCase();
+  const ext = rawExt in MIME_BY_EXT ? rawExt : '.bin';
   const storedName = `media${ext}`;
   const target = path.join(dir, storedName);
   await fs.promises.rename(input.sourcePath, target).catch(async () => {
@@ -77,21 +88,22 @@ export async function createShare(input: {
     await fs.promises.rm(input.sourcePath, { force: true });
   });
 
+  const ownerToken = randomBytes(24).toString('hex');
   const meta: ShareMeta = {
     id,
     title: (input.title || input.fileName.replace(/\.[^/.]+$/, '')).slice(0, 200),
     fileName: input.fileName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').slice(0, 200) || storedName,
     storedName,
-    mimeType: input.mimeType && input.mimeType !== 'application/octet-stream' ? input.mimeType : mimeFromName(input.fileName),
+    mimeType: mimeFromName(storedName),
     size: (await fs.promises.stat(target)).size,
     createdAt: new Date().toISOString(),
     durationSeconds: input.durationSeconds,
     language: input.language,
     segments: input.segments?.length ? input.segments : undefined,
-    ownerToken: randomBytes(24).toString('hex'),
+    ownerTokenHash: hashToken(ownerToken),
   };
   await writeMeta(meta);
-  return meta;
+  return { ...meta, ownerToken };
 }
 
 export async function getShare(id: string): Promise<ShareMeta | null> {
@@ -108,23 +120,37 @@ export function shareFilePath(meta: ShareMeta): string {
 }
 
 export function isOwner(meta: ShareMeta, token: unknown): boolean {
-  if (typeof token !== 'string' || token.length !== meta.ownerToken.length) return false;
-  return timingSafeEqual(Buffer.from(token), Buffer.from(meta.ownerToken));
+  if (typeof token !== 'string' || !token) return false;
+  const expected = meta.ownerTokenHash ?? (meta.ownerToken ? hashToken(meta.ownerToken) : '');
+  if (!expected) return false;
+  return timingSafeEqual(Buffer.from(hashToken(token)), Buffer.from(expected));
 }
 
-export async function updateShare(meta: ShareMeta, patch: Partial<Pick<ShareMeta, 'title' | 'segments' | 'durationSeconds' | 'language'>>) {
-  const next = { ...meta, ...patch };
-  await writeMeta(next);
-  return next;
+const updateLocks = new Map<string, Promise<unknown>>();
+
+/** Update diserialkan per share dan memakai meta terbaru dari disk, sehingga update bersamaan tidak saling menimpa. */
+export function updateShare(meta: ShareMeta, patch: Partial<Pick<ShareMeta, 'title' | 'segments' | 'durationSeconds' | 'language'>>): Promise<ShareMeta> {
+  const previous = updateLocks.get(meta.id) ?? Promise.resolve();
+  const run = previous.catch(() => {}).then(async () => {
+    const latest = (await getShare(meta.id)) ?? meta;
+    const next = { ...latest, ...patch };
+    await writeMeta(next);
+    return next;
+  });
+  const tail: Promise<unknown> = run.catch(() => {}).finally(() => {
+    if (updateLocks.get(meta.id) === tail) updateLocks.delete(meta.id);
+  });
+  updateLocks.set(meta.id, tail);
+  return run;
 }
 
 export async function deleteShare(meta: ShareMeta) {
   await fs.promises.rm(shareDir(meta.id), { recursive: true, force: true });
 }
 
-/** Data yang aman ditampilkan ke publik (tanpa ownerToken). */
+/** Data yang aman ditampilkan ke publik (tanpa token pemilik). */
 export function publicShare(meta: ShareMeta) {
-  const { ownerToken: _token, storedName: _stored, ...rest } = meta;
+  const { ownerToken: _token, ownerTokenHash: _hash, storedName: _stored, ...rest } = meta;
   return {
     ...rest,
     streamUrl: `/api/shares/${meta.id}/stream`,
